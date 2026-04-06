@@ -4,52 +4,62 @@
 const CONFIG = {
   canvas: { width: 960, height: 540 },
   arena: {
-    floorY: 470,
-    left: 30,
-    right: 930,
+    left: 32,
+    right: 928,
+    top: 32,
+    bottom: 508,
   },
   player: {
     radius: 14,
-    moveSpeed: 260,
-    climbSpeed: 220,
-    jumpDuration: 0.28,
-    diveSpeed: 720,
-    spawnX: 120,
-    spawnY: 470,
-    color: '#7ce7ff',
-    dangerColor: '#ffb7b7',
+    speed: 260,
+    dashSpeed: 760,
+    dashDuration: 0.22,
+    dashCooldown: 0.35,
+    knockbackDuration: 0.32,
+    knockbackSpeed: 360,
+    invulnAfterDisarm: 0.8,
+    spawnX: 170,
+    spawnY: 280,
+    color: '#74e6ff',
+    unarmedColor: '#4f7b89',
+    flashColor: '#ffffff',
   },
-  pillars: {
-    mountRange: 48,
-    jumpRange: 230,
-    exposeHeight: 200,
-    list: [
-      { id: 0, x: 280, width: 72, topY: 360 },
-      { id: 1, x: 430, width: 72, topY: 290 },
-      { id: 2, x: 590, width: 72, topY: 235 },
-    ],
+  spear: {
+    radius: 8,
+    recoverDistance: 20,
+    ejectSpeed: 280,
+    ejectTime: 0.25,
+    safeMargin: 40,
+    colorLoose: '#ffd27a',
+    colorEmbedded: '#d6deef',
   },
   boss: {
-    x: 810,
-    y: 362,
-    bodyRadius: 120,
+    x: 735,
+    y: 270,
+    radius: 96,
     weakRadius: 24,
-    weakOffsetX: -84,
-    weakOffsetY: -54,
-    color: '#6f78ab',
-    weakHidden: '#313754',
-    weakVisible: '#ff6363',
+    weakOffset: 72,
+    turnSpeed: 2.8,
+    color: '#6977a8',
+    weakColor: '#ff6a6a',
+    hiddenWeakColor: '#2f3554',
+  },
+  pillars: {
+    list: [
+      { x: 360, y: 180, radius: 34 },
+      { x: 430, y: 330, radius: 40 },
+      { x: 560, y: 230, radius: 36 },
+    ],
+    color: '#6f85b8',
   },
   pattern: {
-    stalkDuration: 1.2,
-    shockwaveDuration: 0.9,
-    recoveryDuration: 1.1,
-    shockwaveSpeed: 320,
-    shockwaveWidth: 20,
-    boltWindup: 0.7,
-    boltRadius: 16,
-    boltCooldownMin: 1.4,
-    boltCooldownMax: 2.4,
+    aimDuration: 1.0,
+    fireDuration: 0.8,
+    recoverDuration: 0.9,
+    projectileSpeed: 360,
+    projectileRadius: 10,
+    shockwaveSpeed: 260,
+    shockwaveWidth: 22,
   },
   ui: {
     transientDuration: 1.0,
@@ -66,9 +76,13 @@ const ASSETS = {
     pillar: 'assets/images/pillar.png',
     weak: 'assets/images/weak-point.png',
     arena: 'assets/images/arena.png',
+    spear: 'assets/images/spear.png',
   },
 };
 
+// =========================
+// Helper creation / DOM / loader
+// =========================
 function getDomRefs() {
   const canvas = document.getElementById('gameCanvas');
   return {
@@ -94,12 +108,13 @@ function loadImages(imageMap) {
   ).then((pairs) => Object.fromEntries(pairs));
 }
 
-function randRange(min, max) {
-  return min + Math.random() * (max - min);
-}
-
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
+}
+
+function lerpAngle(a, b, t) {
+  let d = ((b - a + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  return a + d * t;
 }
 
 function circleHit(a, b) {
@@ -109,17 +124,34 @@ function circleHit(a, b) {
   return dx * dx + dy * dy <= rr * rr;
 }
 
+function distance(ax, ay, bx, by) {
+  return Math.hypot(ax - bx, ay - by);
+}
+
 function createPlayer() {
   return {
     x: CONFIG.player.spawnX,
     y: CONFIG.player.spawnY,
     radius: CONFIG.player.radius,
-    action: 'grounded', // grounded | climbing | jumping | diving
-    support: 'ground', // ground | pillar
-    pillarId: null,
-    jump: null,
-    dive: null,
-    alive: true,
+    action: 'grounded', // grounded | dashing | knockback
+    dash: null,
+    knockback: null,
+    dashCooldown: 0,
+    invulnTimer: 0,
+    flashTimer: 0,
+    lastMoveDir: { x: 1, y: 0 },
+  };
+}
+
+function createSpear() {
+  return {
+    state: 'held', // held | loose | embedded
+    x: CONFIG.player.spawnX,
+    y: CONFIG.player.spawnY,
+    vx: 0,
+    vy: 0,
+    timer: 0,
+    radius: CONFIG.spear.radius,
   };
 }
 
@@ -127,11 +159,12 @@ function createBoss() {
   return {
     x: CONFIG.boss.x,
     y: CONFIG.boss.y,
-    radius: CONFIG.boss.bodyRadius,
-    phase: 'stalk', // stalk | shockwave | recovery
-    timer: 0,
+    radius: CONFIG.boss.radius,
+    facing: Math.PI,
+    phaseStep: 'aim', // aim | fire | recover
+    stepTimer: 0,
+    fireShotsDone: 0,
     weakExposed: false,
-    boltTimer: randRange(CONFIG.pattern.boltCooldownMin, CONFIG.pattern.boltCooldownMax),
   };
 }
 
@@ -144,69 +177,66 @@ function createInitialGameState() {
     keys: new Set(),
     pressed: new Set(),
     player: createPlayer(),
+    spear: createSpear(),
     boss: createBoss(),
+    projectiles: [],
     shockwaves: [],
-    bolts: [],
     assets: { images: {} },
-    ui: { transient: '', transientTimer: 0 },
+    ui: { transient: '', timer: 0 },
   };
-}
-
-function createShockwave() {
-  return {
-    x: gameState.boss.x - 24,
-    y: CONFIG.arena.floorY,
-    radius: 28,
-    width: CONFIG.pattern.shockwaveWidth,
-    dead: false,
-  };
-}
-
-function createBoltTarget(pillarId) {
-  const pillar = CONFIG.pillars.list.find((p) => p.id === pillarId);
-  return {
-    x: pillar.x,
-    y: pillar.topY,
-    radius: CONFIG.pattern.boltRadius,
-    state: 'windup', // windup | strike
-    timer: 0,
-    dead: false,
-  };
-}
-
-function getPillarById(id) {
-  return CONFIG.pillars.list.find((p) => p.id === id) || null;
-}
-
-function getBossWeakPoint() {
-  return {
-    x: gameState.boss.x + CONFIG.boss.weakOffsetX,
-    y: gameState.boss.y + CONFIG.boss.weakOffsetY,
-    radius: CONFIG.boss.weakRadius,
-  };
-}
-
-function canPlayerSeeWeakPoint() {
-  const player = gameState.player;
-  const heightGain = CONFIG.arena.floorY - player.y;
-  const highEnough = heightGain >= CONFIG.pillars.exposeHeight;
-  return highEnough && gameState.boss.weakExposed;
 }
 
 function resetBattle() {
   gameState.phase = 'playing';
   gameState.result = null;
   gameState.player = createPlayer();
+  gameState.spear = createSpear();
   gameState.boss = createBoss();
+  gameState.projectiles = [];
   gameState.shockwaves = [];
-  gameState.bolts = [];
-  gameState.ui.transient = 'Dodge first. Climb. Commit to one dive.';
-  gameState.ui.transientTimer = CONFIG.ui.transientDuration;
+  gameState.ui.transient = 'Find the angle. Dash once. End it.';
+  gameState.ui.timer = CONFIG.ui.transientDuration;
 }
 
 function setGameOver(result) {
   gameState.phase = 'gameover';
   gameState.result = result;
+}
+
+function isPlayerArmed() {
+  return gameState.spear.state === 'held';
+}
+
+function getBossWeakPoint() {
+  const boss = gameState.boss;
+  const backX = Math.cos(boss.facing + Math.PI);
+  const backY = Math.sin(boss.facing + Math.PI);
+  return {
+    x: boss.x + backX * CONFIG.boss.weakOffset,
+    y: boss.y + backY * CONFIG.boss.weakOffset,
+    radius: CONFIG.boss.weakRadius,
+  };
+}
+
+function createBossProjectile(angle) {
+  return {
+    x: gameState.boss.x,
+    y: gameState.boss.y,
+    vx: Math.cos(angle) * CONFIG.pattern.projectileSpeed,
+    vy: Math.sin(angle) * CONFIG.pattern.projectileSpeed,
+    radius: CONFIG.pattern.projectileRadius,
+    dead: false,
+  };
+}
+
+function createShockwave() {
+  return {
+    x: gameState.boss.x,
+    y: gameState.boss.y,
+    radius: gameState.boss.radius + 6,
+    width: CONFIG.pattern.shockwaveWidth,
+    dead: false,
+  };
 }
 
 const dom = getDomRefs();
@@ -237,294 +267,311 @@ function update(dt) {
   }
 
   updateTransient(dt);
-  updateBossPattern(dt);
-  updateGroundBoltSpawner(dt);
+  updateBoss(dt);
   updatePlayer(dt);
+  updateSpear(dt);
+  updateProjectiles(dt);
   updateShockwaves(dt);
-  updateBolts(dt);
-  checkDamageToPlayer();
+  resolveDamage();
+  checkSpearRecovery();
   cleanDynamicArrays();
   gameState.pressed.clear();
 }
 
 function updateTransient(dt) {
-  if (gameState.ui.transientTimer > 0) {
-    gameState.ui.transientTimer = Math.max(0, gameState.ui.transientTimer - dt);
-    if (gameState.ui.transientTimer === 0) {
+  if (gameState.ui.timer > 0) {
+    gameState.ui.timer = Math.max(0, gameState.ui.timer - dt);
+    if (gameState.ui.timer === 0) {
       gameState.ui.transient = '';
     }
   }
 }
 
-function updateBossPattern(dt) {
+function updateBoss(dt) {
   const boss = gameState.boss;
-  boss.timer += dt;
+  const p = gameState.player;
+  const targetAngle = Math.atan2(p.y - boss.y, p.x - boss.x);
+  boss.facing = lerpAngle(boss.facing, targetAngle, Math.min(1, CONFIG.boss.turnSpeed * dt));
 
-  if (boss.phase === 'stalk') {
+  boss.stepTimer += dt;
+
+  if (boss.phaseStep === 'aim') {
     boss.weakExposed = false;
-    if (boss.timer >= CONFIG.pattern.stalkDuration) {
-      boss.phase = 'shockwave';
-      boss.timer = 0;
-      gameState.shockwaves.push(createShockwave());
-      gameState.ui.transient = 'Shockwave! Keep moving or climb.';
-      gameState.ui.transientTimer = 0.9;
+    if (boss.stepTimer >= CONFIG.pattern.aimDuration) {
+      boss.phaseStep = 'fire';
+      boss.stepTimer = 0;
+      boss.fireShotsDone = 0;
     }
     return;
   }
 
-  if (boss.phase === 'shockwave') {
+  if (boss.phaseStep === 'fire') {
     boss.weakExposed = false;
-    if (boss.timer >= CONFIG.pattern.shockwaveDuration) {
-      boss.phase = 'recovery';
-      boss.timer = 0;
+
+    const shouldFire = Math.floor((boss.stepTimer / CONFIG.pattern.fireDuration) * 3);
+    while (boss.fireShotsDone <= shouldFire && boss.fireShotsDone < 3) {
+      fireBossBurst();
+      boss.fireShotsDone += 1;
+    }
+
+    if (boss.stepTimer >= CONFIG.pattern.fireDuration) {
+      boss.phaseStep = 'recover';
+      boss.stepTimer = 0;
       boss.weakExposed = true;
-      gameState.ui.transient = 'Back open! From high pillar, dive now!';
-      gameState.ui.transientTimer = 1.0;
+      gameState.shockwaves.push(createShockwave());
+      gameState.ui.transient = 'Boss recovering: strike from behind!';
+      gameState.ui.timer = 0.9;
     }
     return;
   }
 
-  if (boss.phase === 'recovery') {
+  if (boss.phaseStep === 'recover') {
     boss.weakExposed = true;
-    if (boss.timer >= CONFIG.pattern.recoveryDuration) {
-      boss.phase = 'stalk';
-      boss.timer = 0;
+    if (boss.stepTimer >= CONFIG.pattern.recoverDuration) {
+      boss.phaseStep = 'aim';
+      boss.stepTimer = 0;
       boss.weakExposed = false;
     }
   }
 }
 
-function updateGroundBoltSpawner(dt) {
-  const boss = gameState.boss;
-  boss.boltTimer -= dt;
-  if (boss.boltTimer > 0) {
-    return;
-  }
-
-  const target = chooseBoltTargetPillar();
-  gameState.bolts.push(createBoltTarget(target));
-  boss.boltTimer = randRange(CONFIG.pattern.boltCooldownMin, CONFIG.pattern.boltCooldownMax);
-}
-
-function chooseBoltTargetPillar() {
-  const player = gameState.player;
-  if (player.support === 'pillar' && player.pillarId !== null) {
-    return player.pillarId;
-  }
-
-  const idx = Math.floor(Math.random() * CONFIG.pillars.list.length);
-  return CONFIG.pillars.list[idx].id;
+function fireBossBurst() {
+  const base = gameState.boss.facing;
+  const spread = 0.24;
+  gameState.projectiles.push(createBossProjectile(base - spread));
+  gameState.projectiles.push(createBossProjectile(base));
+  gameState.projectiles.push(createBossProjectile(base + spread));
 }
 
 function updatePlayer(dt) {
-  const player = gameState.player;
+  const p = gameState.player;
 
-  if (player.action === 'grounded') {
+  if (p.invulnTimer > 0) p.invulnTimer = Math.max(0, p.invulnTimer - dt);
+  if (p.flashTimer > 0) p.flashTimer = Math.max(0, p.flashTimer - dt);
+  if (p.dashCooldown > 0) p.dashCooldown = Math.max(0, p.dashCooldown - dt);
+
+  if (p.action === 'grounded') {
     updateGroundedPlayer(dt);
     return;
   }
 
-  if (player.action === 'climbing') {
-    updateClimbingPlayer(dt);
+  if (p.action === 'dashing') {
+    updateDashingPlayer(dt);
     return;
   }
 
-  if (player.action === 'jumping') {
-    updateJumpingPlayer(dt);
-    return;
-  }
-
-  if (player.action === 'diving') {
-    updateDivingPlayer(dt);
+  if (p.action === 'knockback') {
+    updateKnockbackPlayer(dt);
   }
 }
 
 function updateGroundedPlayer(dt) {
-  const player = gameState.player;
-  let dir = 0;
-  if (gameState.keys.has('ArrowLeft') || gameState.keys.has('KeyA')) dir -= 1;
-  if (gameState.keys.has('ArrowRight') || gameState.keys.has('KeyD')) dir += 1;
+  const p = gameState.player;
+  let mx = 0;
+  let my = 0;
 
-  player.x += dir * CONFIG.player.moveSpeed * dt;
-  player.x = clamp(player.x, CONFIG.arena.left, CONFIG.arena.right);
-  player.y = CONFIG.arena.floorY;
+  if (gameState.keys.has('KeyA') || gameState.keys.has('ArrowLeft')) mx -= 1;
+  if (gameState.keys.has('KeyD') || gameState.keys.has('ArrowRight')) mx += 1;
+  if (gameState.keys.has('KeyW') || gameState.keys.has('ArrowUp')) my -= 1;
+  if (gameState.keys.has('KeyS') || gameState.keys.has('ArrowDown')) my += 1;
 
-  if (consumePressed('KeyE')) {
-    tryMountNearestPillar();
+  const mag = Math.hypot(mx, my);
+  if (mag > 0) {
+    const nx = mx / mag;
+    const ny = my / mag;
+    p.lastMoveDir = { x: nx, y: ny };
+    p.x += nx * CONFIG.player.speed * dt;
+    p.y += ny * CONFIG.player.speed * dt;
   }
 
-  if (consumePressed('KeyK')) {
-    tryStartDive();
+  constrainPlayerToArenaAndPillars();
+
+  if (consumePressed('Space') || consumePressed('KeyK')) {
+    tryStartDash();
   }
 }
 
-function updateClimbingPlayer(dt) {
-  const player = gameState.player;
-  const jump = player.jump;
-  jump.progress += dt * (CONFIG.player.climbSpeed / Math.max(1, jump.distance));
+function updateDashingPlayer(dt) {
+  const p = gameState.player;
+  const dash = p.dash;
 
-  if (jump.progress >= 1) {
-    player.x = jump.toX;
-    player.y = jump.toY;
-    player.action = 'grounded';
-    player.support = 'pillar';
-    player.pillarId = jump.toPillarId;
-    player.jump = null;
-    return;
-  }
+  p.x += dash.vx * dt;
+  p.y += dash.vy * dt;
+  dash.timer -= dt;
 
-  const t = jump.progress;
-  player.x = jump.fromX + (jump.toX - jump.fromX) * t;
-  player.y = jump.fromY + (jump.toY - jump.fromY) * t;
-}
-
-function updateJumpingPlayer(dt) {
-  const player = gameState.player;
-  const jump = player.jump;
-  jump.progress += dt / CONFIG.player.jumpDuration;
-
-  if (jump.progress >= 1) {
-    player.x = jump.toX;
-    player.y = jump.toY;
-    player.action = 'grounded';
-    player.support = 'pillar';
-    player.pillarId = jump.toPillarId;
-    player.jump = null;
-    return;
-  }
-
-  const t = jump.progress;
-  const arc = Math.sin(Math.PI * t) * 45;
-  player.x = jump.fromX + (jump.toX - jump.fromX) * t;
-  player.y = jump.fromY + (jump.toY - jump.fromY) * t - arc;
-}
-
-function updateDivingPlayer(dt) {
-  const player = gameState.player;
-  const dive = player.dive;
-
-  player.x += dive.vx * dt;
-  player.y += dive.vy * dt;
+  constrainPlayerToArenaAndPillars(true);
 
   const weak = getBossWeakPoint();
-  if (canPlayerSeeWeakPoint() && circleHit(player, weak)) {
+  const boss = gameState.boss;
+
+  if (gameState.boss.weakExposed && circleHit(p, weak)) {
     setGameOver('victory');
     return;
   }
 
-  if (circleHit(player, gameState.boss)) {
+  if (circleHit(p, boss)) {
     setGameOver('defeat');
     return;
   }
 
-  if (player.y >= CONFIG.arena.floorY) {
-    setGameOver('defeat');
-    return;
-  }
-
-  if (player.x < 0 || player.x > CONFIG.canvas.width || player.y < 0 || player.y > CONFIG.canvas.height + 20) {
+  if (dash.timer <= 0) {
+    // decisive commitment: miss = defeat
     setGameOver('defeat');
   }
 }
 
-function tryMountNearestPillar() {
-  const player = gameState.player;
-
-  if (player.support === 'pillar' && player.pillarId !== null) {
-    // drop from pillar (still committed risk because boss attacks continue)
-    player.support = 'ground';
-    player.pillarId = null;
-    player.y = CONFIG.arena.floorY;
+function updateKnockbackPlayer(dt) {
+  const p = gameState.player;
+  const kb = p.knockback;
+  if (!kb) {
+    p.action = 'grounded';
     return;
   }
 
-  const nearest = findNearestMountablePillar(player.x);
-  if (!nearest) {
-    return;
-  }
+  kb.timer -= dt;
+  p.x += kb.vx * dt;
+  p.y += kb.vy * dt;
+  kb.vx *= 0.9;
+  kb.vy *= 0.9;
 
-  player.action = 'climbing';
-  player.support = 'ground';
-  player.jump = {
-    fromX: player.x,
-    fromY: player.y,
-    toX: nearest.x,
-    toY: nearest.topY,
-    toPillarId: nearest.id,
-    progress: 0,
-    distance: Math.hypot(nearest.x - player.x, nearest.topY - player.y),
-  };
+  constrainPlayerToArenaAndPillars();
+
+  if (kb.timer <= 0) {
+    p.action = 'grounded';
+    p.knockback = null;
+  }
 }
 
-function findNearestMountablePillar(x) {
-  let best = null;
-  let bestDist = Infinity;
+function constrainPlayerToArenaAndPillars(allowSlide = false) {
+  const p = gameState.player;
+
+  p.x = clamp(p.x, CONFIG.arena.left + p.radius, CONFIG.arena.right - p.radius);
+  p.y = clamp(p.y, CONFIG.arena.top + p.radius, CONFIG.arena.bottom - p.radius);
 
   CONFIG.pillars.list.forEach((pillar) => {
-    const dist = Math.abs(x - pillar.x);
-    if (dist <= CONFIG.pillars.mountRange && dist < bestDist) {
-      best = pillar;
-      bestDist = dist;
+    const dx = p.x - pillar.x;
+    const dy = p.y - pillar.y;
+    const minD = p.radius + pillar.radius;
+    const d = Math.hypot(dx, dy) || 0.0001;
+    if (d < minD) {
+      const nx = dx / d;
+      const ny = dy / d;
+      p.x = pillar.x + nx * minD;
+      p.y = pillar.y + ny * minD;
+
+      if (allowSlide && p.action === 'dashing') {
+        // dash clipped by obstacle => missed commitment
+        setGameOver('defeat');
+      }
+    }
+  });
+}
+
+function tryStartDash() {
+  const p = gameState.player;
+  if (!isPlayerArmed()) return;
+  if (p.action !== 'grounded' || p.dashCooldown > 0) return;
+
+  const dir = p.lastMoveDir;
+  p.action = 'dashing';
+  p.dash = {
+    vx: dir.x * CONFIG.player.dashSpeed,
+    vy: dir.y * CONFIG.player.dashSpeed,
+    timer: CONFIG.player.dashDuration,
+  };
+  p.dashCooldown = CONFIG.player.dashCooldown;
+}
+
+function updateSpear(dt) {
+  const spear = gameState.spear;
+  const p = gameState.player;
+
+  if (spear.state === 'held') {
+    spear.x = p.x + p.lastMoveDir.x * 14;
+    spear.y = p.y + p.lastMoveDir.y * 14;
+    return;
+  }
+
+  if (spear.state === 'loose') {
+    spear.timer -= dt;
+    spear.x += spear.vx * dt;
+    spear.y += spear.vy * dt;
+    spear.vx *= 0.86;
+    spear.vy *= 0.86;
+
+    if (spear.timer <= 0) {
+      const safe = getRecoverableSpearSpot(spear.x, spear.y);
+      spear.x = safe.x;
+      spear.y = safe.y;
+      spear.vx = 0;
+      spear.vy = 0;
+      spear.state = 'embedded';
+    }
+  }
+}
+
+function getRecoverableSpearSpot(rawX, rawY) {
+  let x = clamp(rawX, CONFIG.arena.left + CONFIG.spear.safeMargin, CONFIG.arena.right - CONFIG.spear.safeMargin);
+  let y = clamp(rawY, CONFIG.arena.top + CONFIG.spear.safeMargin, CONFIG.arena.bottom - CONFIG.spear.safeMargin);
+
+  // never allow embedding inside pillar or boss body
+  CONFIG.pillars.list.forEach((pillar) => {
+    const d = distance(x, y, pillar.x, pillar.y);
+    const minD = pillar.radius + CONFIG.spear.recoverDistance;
+    if (d < minD) {
+      const nx = (x - pillar.x) / (d || 1);
+      const ny = (y - pillar.y) / (d || 1);
+      x = pillar.x + nx * minD;
+      y = pillar.y + ny * minD;
     }
   });
 
-  return best;
+  const db = distance(x, y, gameState.boss.x, gameState.boss.y);
+  const minBoss = gameState.boss.radius + CONFIG.spear.recoverDistance + 10;
+  if (db < minBoss) {
+    const nx = (x - gameState.boss.x) / (db || 1);
+    const ny = (y - gameState.boss.y) / (db || 1);
+    x = gameState.boss.x + nx * minBoss;
+    y = gameState.boss.y + ny * minBoss;
+  }
+
+  x = clamp(x, CONFIG.arena.left + CONFIG.spear.safeMargin, CONFIG.arena.right - CONFIG.spear.safeMargin);
+  y = clamp(y, CONFIG.arena.top + CONFIG.spear.safeMargin, CONFIG.arena.bottom - CONFIG.spear.safeMargin);
+  return { x, y };
 }
 
-function tryPillarJump() {
-  const player = gameState.player;
-  if (player.support !== 'pillar' || player.pillarId === null || player.action !== 'grounded') {
-    return;
+function checkSpearRecovery() {
+  const spear = gameState.spear;
+  if (spear.state !== 'embedded') return;
+  if (circleHit(gameState.player, { x: spear.x, y: spear.y, radius: CONFIG.spear.recoverDistance })) {
+    spear.state = 'held';
+    gameState.ui.transient = 'Spear recovered. You can attack safely again.';
+    gameState.ui.timer = 0.9;
   }
-
-  let dir = 0;
-  if (gameState.keys.has('ArrowLeft') || gameState.keys.has('KeyA')) dir = -1;
-  if (gameState.keys.has('ArrowRight') || gameState.keys.has('KeyD')) dir = 1;
-  if (dir === 0) {
-    return;
-  }
-
-  const from = getPillarById(player.pillarId);
-  const candidates = CONFIG.pillars.list
-    .filter((pillar) => pillar.id !== from.id && (pillar.x - from.x) * dir > 0)
-    .filter((pillar) => Math.abs(pillar.x - from.x) <= CONFIG.pillars.jumpRange)
-    .sort((a, b) => Math.abs(a.x - from.x) - Math.abs(b.x - from.x));
-
-  const to = candidates[0];
-  if (!to) {
-    return;
-  }
-
-  player.action = 'jumping';
-  player.jump = {
-    fromX: player.x,
-    fromY: player.y,
-    toX: to.x,
-    toY: to.topY,
-    toPillarId: to.id,
-    progress: 0,
-  };
 }
 
-function tryStartDive() {
-  const player = gameState.player;
+function updateProjectiles(dt) {
+  gameState.projectiles.forEach((proj) => {
+    proj.x += proj.vx * dt;
+    proj.y += proj.vy * dt;
 
-  if (player.action !== 'grounded' || player.support !== 'pillar' || !canPlayerSeeWeakPoint()) {
-    return;
-  }
+    if (
+      proj.x < CONFIG.arena.left - 30 ||
+      proj.x > CONFIG.arena.right + 30 ||
+      proj.y < CONFIG.arena.top - 30 ||
+      proj.y > CONFIG.arena.bottom + 30
+    ) {
+      proj.dead = true;
+      return;
+    }
 
-  const weak = getBossWeakPoint();
-  const dx = weak.x - player.x;
-  const dy = weak.y - player.y;
-  const mag = Math.hypot(dx, dy) || 1;
-
-  player.action = 'diving';
-  player.support = 'air';
-  player.pillarId = null;
-  player.dive = {
-    vx: (dx / mag) * CONFIG.player.diveSpeed,
-    vy: (dy / mag) * CONFIG.player.diveSpeed + 100,
-  };
+    for (const pillar of CONFIG.pillars.list) {
+      if (circleHit(proj, { x: pillar.x, y: pillar.y, radius: pillar.radius })) {
+        proj.dead = true;
+        return;
+      }
+    }
+  });
 }
 
 function updateShockwaves(dt) {
@@ -536,75 +583,79 @@ function updateShockwaves(dt) {
   });
 }
 
-function updateBolts(dt) {
-  gameState.bolts.forEach((bolt) => {
-    bolt.timer += dt;
+function resolveDamage() {
+  if (gameState.phase !== 'playing') return;
+  const p = gameState.player;
 
-    if (bolt.state === 'windup' && bolt.timer >= CONFIG.pattern.boltWindup) {
-      bolt.state = 'strike';
-      bolt.timer = 0;
+  for (const proj of gameState.projectiles) {
+    if (!proj.dead && circleHit(p, proj)) {
+      proj.dead = true;
+      handlePlayerHit(proj.x, proj.y);
       return;
     }
+  }
 
-    if (bolt.state === 'strike' && bolt.timer >= 0.2) {
-      bolt.dead = true;
+  for (const ring of gameState.shockwaves) {
+    const d = distance(p.x, p.y, ring.x, ring.y);
+    const onBand = d >= ring.radius - ring.width && d <= ring.radius + ring.width;
+    if (onBand) {
+      handlePlayerHit(ring.x, ring.y);
+      return;
     }
-  });
+  }
 }
 
-function checkDamageToPlayer() {
-  if (gameState.phase !== 'playing') {
+function handlePlayerHit(sourceX, sourceY) {
+  const p = gameState.player;
+  if (p.invulnTimer > 0) return;
+
+  if (isPlayerArmed()) {
+    disarmAndKnockback(sourceX, sourceY);
     return;
   }
 
+  setGameOver('defeat');
+}
+
+function disarmAndKnockback(sourceX, sourceY) {
   const p = gameState.player;
+  const spear = gameState.spear;
 
-  for (const ring of gameState.shockwaves) {
-    const dist = Math.abs(p.x - ring.x);
-    const onBand = dist >= ring.radius - ring.width && dist <= ring.radius + ring.width;
-    const lowEnough = p.y >= CONFIG.arena.floorY - 18;
-    if (onBand && lowEnough && p.action !== 'diving') {
-      setGameOver('defeat');
-      return;
-    }
-  }
+  const dx = p.x - sourceX;
+  const dy = p.y - sourceY;
+  const mag = Math.hypot(dx, dy) || 1;
+  const nx = dx / mag;
+  const ny = dy / mag;
 
-  for (const bolt of gameState.bolts) {
-    if (bolt.state !== 'strike') {
-      continue;
-    }
-    if (circleHit(p, { x: bolt.x, y: bolt.y, radius: bolt.radius + 10 })) {
-      setGameOver('defeat');
-      return;
-    }
-  }
+  p.action = 'knockback';
+  p.knockback = {
+    vx: nx * CONFIG.player.knockbackSpeed,
+    vy: ny * CONFIG.player.knockbackSpeed,
+    timer: CONFIG.player.knockbackDuration,
+  };
+  p.invulnTimer = CONFIG.player.invulnAfterDisarm;
+  p.flashTimer = 0.24;
+
+  spear.state = 'loose';
+  spear.x = p.x + nx * 12;
+  spear.y = p.y + ny * 12;
+  spear.vx = nx * CONFIG.spear.ejectSpeed;
+  spear.vy = ny * CONFIG.spear.ejectSpeed;
+  spear.timer = CONFIG.spear.ejectTime;
+
+  gameState.ui.transient = 'Disarmed! Recover spear before next hit.';
+  gameState.ui.timer = 1.0;
 }
 
 function cleanDynamicArrays() {
-  gameState.shockwaves = gameState.shockwaves.filter((ring) => !ring.dead);
-  gameState.bolts = gameState.bolts.filter((bolt) => !bolt.dead);
+  gameState.projectiles = gameState.projectiles.filter((p) => !p.dead);
+  gameState.shockwaves = gameState.shockwaves.filter((r) => !r.dead);
 }
 
 function consumePressed(code) {
-  if (!gameState.pressed.has(code)) {
-    return false;
-  }
+  if (!gameState.pressed.has(code)) return false;
   gameState.pressed.delete(code);
   return true;
-}
-
-function updatePlayerActionInputs() {
-  if (gameState.phase !== 'playing') {
-    return;
-  }
-
-  if (consumePressed('KeyJ')) {
-    tryPillarJump();
-  }
-
-  if (consumePressed('KeyK')) {
-    tryStartDive();
-  }
 }
 
 // =========================
@@ -614,9 +665,9 @@ function drawImageOrFallback(ctx, key, x, y, w, h, fallback) {
   const asset = gameState.assets.images[key];
   if (asset?.ok && asset.img) {
     ctx.drawImage(asset.img, x, y, w, h);
-    return;
+  } else {
+    fallback();
   }
-  fallback();
 }
 
 function render() {
@@ -626,48 +677,49 @@ function render() {
   drawArena(ctx);
   drawPillars(ctx);
   drawBoss(ctx);
+  drawProjectiles(ctx);
   drawShockwaves(ctx);
-  drawBolts(ctx);
+  drawSpear(ctx);
   drawPlayer(ctx);
-  drawHintLines(ctx);
+  drawDamageFlash(ctx);
   renderUI();
 }
 
 function drawArena(ctx) {
   drawImageOrFallback(ctx, 'arena', 0, 0, CONFIG.canvas.width, CONFIG.canvas.height, () => {
     const g = ctx.createLinearGradient(0, 0, 0, CONFIG.canvas.height);
-    g.addColorStop(0, '#18243a');
-    g.addColorStop(1, '#0f1626');
+    g.addColorStop(0, '#19233b');
+    g.addColorStop(1, '#0d1526');
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, CONFIG.canvas.width, CONFIG.canvas.height);
   });
 
-  ctx.fillStyle = '#1f2b43';
-  ctx.fillRect(0, CONFIG.arena.floorY, CONFIG.canvas.width, CONFIG.canvas.height - CONFIG.arena.floorY);
-
-  ctx.strokeStyle = '#405073';
+  ctx.strokeStyle = '#3d4d70';
   ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(0, CONFIG.arena.floorY);
-  ctx.lineTo(CONFIG.canvas.width, CONFIG.arena.floorY);
-  ctx.stroke();
+  ctx.strokeRect(
+    CONFIG.arena.left,
+    CONFIG.arena.top,
+    CONFIG.arena.right - CONFIG.arena.left,
+    CONFIG.arena.bottom - CONFIG.arena.top
+  );
 }
 
 function drawPillars(ctx) {
-  CONFIG.pillars.list.forEach((pillar, index) => {
-    const h = CONFIG.arena.floorY - pillar.topY;
-    const left = pillar.x - pillar.width / 2;
-
-    drawImageOrFallback(ctx, 'pillar', left, pillar.topY, pillar.width, h, () => {
-      ctx.fillStyle = ['#4a5d84', '#5b6e99', '#6d82af'][index % 3];
-      ctx.fillRect(left, pillar.topY, pillar.width, h);
-      ctx.fillStyle = '#8fa4d1';
-      ctx.fillRect(left - 4, pillar.topY - 10, pillar.width + 8, 10);
-    });
-
-    ctx.fillStyle = '#c8d5f5';
-    ctx.font = '12px sans-serif';
-    ctx.fillText(`H${Math.round(CONFIG.arena.floorY - pillar.topY)}`, pillar.x - 18, pillar.topY - 16);
+  CONFIG.pillars.list.forEach((pillar) => {
+    drawImageOrFallback(
+      ctx,
+      'pillar',
+      pillar.x - pillar.radius,
+      pillar.y - pillar.radius,
+      pillar.radius * 2,
+      pillar.radius * 2,
+      () => {
+        ctx.fillStyle = CONFIG.pillars.color;
+        ctx.beginPath();
+        ctx.arc(pillar.x, pillar.y, pillar.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    );
   });
 }
 
@@ -689,9 +741,16 @@ function drawBoss(ctx) {
     }
   );
 
-  const weak = getBossWeakPoint();
-  const visible = canPlayerSeeWeakPoint();
+  // facing direction marker
+  ctx.strokeStyle = '#cfd9f5';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(boss.x, boss.y);
+  ctx.lineTo(boss.x + Math.cos(boss.facing) * boss.radius, boss.y + Math.sin(boss.facing) * boss.radius);
+  ctx.stroke();
 
+  const weak = getBossWeakPoint();
+  const visible = boss.weakExposed;
   drawImageOrFallback(
     ctx,
     'weak',
@@ -700,7 +759,7 @@ function drawBoss(ctx) {
     weak.radius * 2,
     weak.radius * 2,
     () => {
-      ctx.fillStyle = visible ? CONFIG.boss.weakVisible : CONFIG.boss.weakHidden;
+      ctx.fillStyle = visible ? CONFIG.boss.weakColor : CONFIG.boss.hiddenWeakColor;
       ctx.beginPath();
       ctx.arc(weak.x, weak.y, weak.radius, 0, Math.PI * 2);
       ctx.fill();
@@ -708,55 +767,62 @@ function drawBoss(ctx) {
   );
 
   if (visible) {
-    ctx.strokeStyle = '#ffe2e2';
+    ctx.strokeStyle = '#ffdcdc';
     ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.arc(weak.x, weak.y, weak.radius + 6, 0, Math.PI * 2);
+    ctx.arc(weak.x, weak.y, weak.radius + 5, 0, Math.PI * 2);
     ctx.stroke();
   }
 }
 
-function drawShockwaves(ctx) {
-  gameState.shockwaves.forEach((ring) => {
-    ctx.strokeStyle = '#ffcb5f';
-    ctx.lineWidth = 5;
+function drawProjectiles(ctx) {
+  ctx.fillStyle = '#ffc95c';
+  gameState.projectiles.forEach((proj) => {
     ctx.beginPath();
-    ctx.arc(ring.x, ring.y, ring.radius, Math.PI, Math.PI * 2);
-    ctx.stroke();
-  });
-}
-
-function drawBolts(ctx) {
-  gameState.bolts.forEach((bolt) => {
-    if (bolt.state === 'windup') {
-      ctx.strokeStyle = '#ffd77e';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
-      ctx.arc(bolt.x, bolt.y, bolt.radius + 8, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      return;
-    }
-
-    ctx.strokeStyle = '#ff6a5f';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.moveTo(bolt.x, bolt.y - 120);
-    ctx.lineTo(bolt.x, bolt.y + 16);
-    ctx.stroke();
-
-    ctx.fillStyle = '#ff6a5f';
-    ctx.beginPath();
-    ctx.arc(bolt.x, bolt.y, bolt.radius, 0, Math.PI * 2);
+    ctx.arc(proj.x, proj.y, proj.radius, 0, Math.PI * 2);
     ctx.fill();
   });
 }
 
+function drawShockwaves(ctx) {
+  gameState.shockwaves.forEach((ring) => {
+    ctx.strokeStyle = 'rgba(255, 150, 60, 0.9)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(ring.x, ring.y, ring.radius, 0, Math.PI * 2);
+    ctx.stroke();
+  });
+}
+
+function drawSpear(ctx) {
+  const spear = gameState.spear;
+  if (spear.state === 'held') return;
+
+  drawImageOrFallback(ctx, 'spear', spear.x - 12, spear.y - 2, 24, 4, () => {
+    ctx.strokeStyle = spear.state === 'loose' ? CONFIG.spear.colorLoose : CONFIG.spear.colorEmbedded;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(spear.x - 12, spear.y);
+    ctx.lineTo(spear.x + 12, spear.y);
+    ctx.stroke();
+  });
+
+  if (spear.state === 'embedded') {
+    ctx.strokeStyle = 'rgba(255, 238, 170, 0.85)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(spear.x, spear.y, CONFIG.spear.recoverDistance, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
 function drawPlayer(ctx) {
   const p = gameState.player;
-  const diving = p.action === 'diving';
-  const color = diving ? CONFIG.player.dangerColor : CONFIG.player.color;
+  const armed = isPlayerArmed();
+  const flashing = p.flashTimer > 0 && Math.floor(p.flashTimer * 40) % 2 === 0;
+
+  let color = armed ? CONFIG.player.color : CONFIG.player.unarmedColor;
+  if (flashing) color = CONFIG.player.flashColor;
 
   drawImageOrFallback(ctx, 'player', p.x - p.radius, p.y - p.radius, p.radius * 2, p.radius * 2, () => {
     ctx.fillStyle = color;
@@ -765,60 +831,54 @@ function drawPlayer(ctx) {
     ctx.fill();
   });
 
-  if (p.action === 'diving') {
-    ctx.strokeStyle = '#ffd8d8';
+  if (!armed) {
+    ctx.fillStyle = '#ffbcbc';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('UNARMED', p.x - 26, p.y - 20);
+  }
+
+  if (p.action === 'dashing') {
+    ctx.strokeStyle = '#ffe4e4';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(p.x - 18, p.y - 10);
-    ctx.lineTo(p.x + 18, p.y + 10);
+    ctx.moveTo(p.x - 14, p.y - 14);
+    ctx.lineTo(p.x + 14, p.y + 14);
     ctx.stroke();
   }
 }
 
-function drawHintLines(ctx) {
-  if (gameState.phase !== 'playing') {
-    return;
-  }
-
-  const p = gameState.player;
-  if (p.support === 'pillar' && p.action === 'grounded' && canPlayerSeeWeakPoint()) {
-    const weak = getBossWeakPoint();
-    ctx.strokeStyle = 'rgba(255, 180, 180, 0.8)';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([8, 6]);
-    ctx.beginPath();
-    ctx.moveTo(p.x, p.y);
-    ctx.lineTo(weak.x, weak.y);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
+function drawDamageFlash(ctx) {
+  if (gameState.player.flashTimer <= 0) return;
+  ctx.fillStyle = 'rgba(255, 110, 110, 0.2)';
+  ctx.fillRect(0, 0, CONFIG.canvas.width, CONFIG.canvas.height);
 }
 
 function renderUI() {
   if (gameState.phase === 'start') {
-    dom.overlay.innerHTML = '<div><h1>Plunge Strike MVP</h1><p>Press Enter to Start</p></div>';
+    dom.overlay.innerHTML = '<div><h1>Top-Down Dash Boss MVP</h1><p>Press Enter to Start</p></div>';
     dom.statusText.textContent = 'State: Start';
-    dom.instructionText.textContent = 'Move: A/D or ←/→ | E: Mount/Drop pillar | J: Jump pillar-to-pillar | K: Dive attack';
+    dom.instructionText.textContent = 'Move: WASD/Arrows | Dash Attack: Space or K (committed)';
     return;
   }
 
   if (gameState.phase === 'playing') {
     const p = gameState.player;
+    const armedLabel = isPlayerArmed() ? 'ARMED' : 'UNARMED';
     dom.overlay.innerHTML = '';
-
-    dom.statusText.textContent = `State: Battle | Player: ${p.action}/${p.support} | Boss: ${gameState.boss.phase}`;
+    dom.statusText.textContent = `State: Battle | ${armedLabel} | Player: ${p.action} | Boss: ${gameState.boss.phaseStep}`;
     dom.instructionText.textContent =
       gameState.ui.transient ||
-      'Climb high pillars to reveal the back weak point. Dive is one-way: miss = instant death.';
+      'Use pillars as cover. Attack from behind during recovery. Dash miss/body hit = defeat.';
     return;
   }
 
   const victory = gameState.result === 'victory';
   dom.overlay.innerHTML = victory
-    ? '<div><h1 style="color:#98ff8a">Victory</h1><p>Weak-point plunge landed. Press Enter to Restart.</p></div>'
-    : '<div><h1 style="color:#ff6f6f">Defeat</h1><p>Dive failed or you were hit. Press Enter to Restart.</p></div>';
+    ? '<div><h1 style="color:#98ff8a">Victory</h1><p>Weak point pierced. Press Enter to Restart.</p></div>'
+    : '<div><h1 style="color:#ff6f6f">Defeat</h1><p>You were exposed. Press Enter to Restart.</p></div>';
+
   dom.statusText.textContent = victory ? 'State: Victory' : 'State: Defeat';
-  dom.instructionText.textContent = 'Press Enter to retry from the start of battle.';
+  dom.instructionText.textContent = 'Press Enter to restart.';
 }
 
 function gameLoop(ts) {
@@ -826,10 +886,8 @@ function gameLoop(ts) {
   gameState.dt = Math.min(0.033, now - gameState.now || 0);
   gameState.now = now;
 
-  updatePlayerActionInputs();
   update(gameState.dt);
   render();
-
   requestAnimationFrame(gameLoop);
 }
 
